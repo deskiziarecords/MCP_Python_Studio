@@ -1,0 +1,705 @@
+import flet as ft
+import asyncio
+import json
+from datetime import datetime
+from typing import Dict, List, Optional
+import subprocess
+import aiohttp
+from mcp import ClientSession, StdioServerParameters
+from mcp.client import sse, stdio
+
+class MCPStudioFlet:
+    def __init__(self):
+        self.current_model = "claude-3-5-sonnet"
+        self.connected_servers: Dict[str, Dict] = {}
+        self.active_sessions: Dict[str, ClientSession] = {}
+        self.available_tools: List[Dict] = []
+        self.chat_history = []
+        
+        # MCP Server configurations (predefined examples)
+        self.predefined_servers = {
+            "filesystem": {
+                "type": "stdio",
+                "command": "npx",
+                "args": ["@modelcontextprotocol/server-filesystem", "."],
+                "description": "File system access"
+            },
+            "memory": {
+                "type": "stdio", 
+                "command": "npx",
+                "args": ["@modelcontextprotocol/server-memory"],
+                "description": "Memory operations"
+            },
+            "weather": {
+                "type": "sse",
+                "url": "https://demo.mcp-server.com/weather/sse",
+                "description": "Weather data"
+            }
+        }
+    
+    async def main(self, page: ft.Page):
+        self.page = page
+        page.title = "Python MCP Studio"
+        page.theme_mode = ft.ThemeMode.LIGHT
+        page.padding = 10
+        
+        # Initialize UI components
+        await self.init_components()
+        
+        # Build the UI
+        await self.setup_layout()
+        
+        # Start with filesystem server by default
+        await self.connect_to_server("filesystem")
+    
+    async def init_components(self):
+        """Initialize all UI components"""
+        # Model selection
+        self.model_dropdown = ft.Dropdown(
+            label="AI Model",
+            value=self.current_model,
+            options=[
+                ft.dropdown.Option("claude-3-5-sonnet"),
+                ft.dropdown.Option("gpt-4o"),
+                ft.dropdown.Option("gemini-2.0"),
+            ],
+            width=200,
+            on_change=self.model_changed
+        )
+        
+        # Servers list
+        self.servers_list = ft.Column(
+            spacing=5,
+            scroll=ft.ScrollMode.AUTO
+        )
+        
+        # Chat display
+        self.chat_display = ft.ListView(
+            expand=True,
+            spacing=10,
+            auto_scroll=True
+        )
+        
+        # Tool output display
+        self.tool_output = ft.Column(
+            scroll=ft.ScrollMode.AUTO,
+            spacing=5
+        )
+        
+        # Available tools list
+        self.tools_list = ft.Column(
+            scroll=ft.ScrollMode.AUTO,
+            spacing=3
+        )
+        
+        # Message input
+        self.message_input = ft.TextField(
+            multiline=True,
+            min_lines=3,
+            max_lines=6,
+            expand=True,
+            hint_text="Type your message or /tools to list available tools...",
+            on_submit=self.send_message_async
+        )
+        
+        # Status indicator
+        self.status_indicator = ft.Row([
+            ft.Icon(ft.icons.CIRCLE, size=10, color=ft.colors.RED),
+            ft.Text("Disconnected", size=12)
+        ])
+    
+    async def setup_layout(self):
+        """Setup the main layout with tabs"""
+        # Create tabs
+        tabs = ft.Tabs(
+            selected_index=0,
+            animation_duration=300,
+            tabs=[
+                ft.Tab(
+                    text="Chat",
+                    icon=ft.icons.CHAT,
+                    content=await self.build_chat_tab()
+                ),
+                ft.Tab(
+                    text="Servers",
+                    icon=ft.icons.STORAGE,
+                    content=await self.build_servers_tab()
+                ),
+                ft.Tab(
+                    text="Tools",
+                    icon=ft.icons.BUILD,
+                    content=await self.build_tools_tab()
+                ),
+                ft.Tab(
+                    text="Models",
+                    icon=ft.icons.SMART_TOY,
+                    content=await self.build_models_tab()
+                ),
+            ],
+            expand=True,
+        )
+        
+        self.page.add(tabs)
+    
+    async def build_chat_tab(self):
+        """Build the chat interface tab"""
+        return ft.Container(
+            content=ft.Column([
+                # Header
+                ft.Row([
+                    ft.Text("Chat with MCP Tools", size=20, weight=ft.FontWeight.BOLD),
+                    self.status_indicator
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                
+                # Chat display
+                ft.Container(
+                    content=self.chat_display,
+                    expand=True,
+                    border=ft.border.all(1, ft.colors.OUTLINE),
+                    border_radius=5,
+                    padding=10
+                ),
+                
+                # Tool output section
+                ft.ExpansionTile(
+                    title=ft.Text("Tool Execution Output"),
+                    subtitle=ft.Text("Real-time tool execution results"),
+                    controls=[
+                        ft.Container(
+                            content=self.tool_output,
+                            height=150,
+                            padding=5
+                        )
+                    ]
+                ),
+                
+                # Input area
+                ft.Row([
+                    self.message_input,
+                    ft.IconButton(
+                        icon=ft.icons.SEND,
+                        icon_size=30,
+                        on_click=self.send_message_async,
+                        tooltip="Send message"
+                    ),
+                    ft.IconButton(
+                        icon=ft.icons.CLEAR,
+                        icon_size=25,
+                        on_click=self.clear_chat,
+                        tooltip="Clear chat"
+                    )
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+            ], expand=True),
+            padding=10,
+            expand=True
+        )
+    
+    async def build_servers_tab(self):
+        """Build the servers management tab"""
+        server_buttons = ft.Column([
+            ft.ElevatedButton(
+                text=f"{name} - {config['description']}",
+                icon=ft.icons.ADD_CIRCLE if name not in self.connected_servers else ft.icons.CHECK_CIRCLE,
+                data={"name": name, "config": config},
+                on_click=self.toggle_server_connection,
+                style=ft.ButtonStyle(
+                    color=ft.colors.GREEN if name in self.connected_servers else None
+                )
+            )
+            for name, config in self.predefined_servers.items()
+        ])
+        
+        return ft.Container(
+            content=ft.Column([
+                ft.Text("MCP Server Management", size=20, weight=ft.FontWeight.BOLD),
+                ft.Divider(),
+                
+                # Predefined servers
+                ft.Text("Quick Connect Servers:", size=16, weight=ft.FontWeight.BOLD),
+                server_buttons,
+                
+                ft.Divider(),
+                
+                # Custom server connection
+                ft.Text("Custom Server Connection:", size=16, weight=ft.FontWeight.BOLD),
+                ft.TextField(label="Server Type", value="stdio", read_only=True),
+                ft.TextField(label="Command (e.g., npx)", hint_text="npx"),
+                ft.TextField(label="Arguments", hint_text="@modelcontextprotocol/server-filesystem .", multiline=True),
+                ft.ElevatedButton("Connect Custom Server", icon=ft.icons.LINK),
+                
+                ft.Divider(),
+                
+                # Connected servers list
+                ft.Text("Connected Servers:", size=16, weight=ft.FontWeight.BOLD),
+                ft.Container(
+                    content=self.servers_list,
+                    height=200,
+                    border=ft.border.all(1, ft.colors.OUTLINE),
+                    border_radius=5,
+                    padding=10
+                )
+            ], scroll=ft.ScrollMode.AUTO),
+            padding=20
+        )
+    
+    async def build_tools_tab(self):
+        """Build the tools listing tab"""
+        return ft.Container(
+            content=ft.Column([
+                ft.Text("Available MCP Tools", size=20, weight=ft.FontWeight.BOLD),
+                ft.Divider(),
+                ft.Text("Tools from all connected servers:", size=14),
+                ft.Container(
+                    content=self.tools_list,
+                    height=400,
+                    border=ft.border.all(1, ft.colors.OUTLINE),
+                    border_radius=5,
+                    padding=10
+                ),
+                ft.ElevatedButton(
+                    "Refresh Tools",
+                    icon=ft.icons.REFRESH,
+                    on_click=self.refresh_tools
+                )
+            ]),
+            padding=20
+        )
+    
+    async def build_models_tab(self):
+        """Build the AI models configuration tab"""
+        return ft.Container(
+            content=ft.Column([
+                ft.Text("AI Model Configuration", size=20, weight=ft.FontWeight.BOLD),
+                ft.Divider(),
+                
+                # Model selection
+                ft.Text("Select AI Model:", size=16),
+                self.model_dropdown,
+                
+                # API Key configuration
+                ft.TextField(
+                    label="API Key",
+                    password=True,
+                    can_reveal_password=True,
+                    hint_text="Enter your API key here"
+                ),
+                ft.TextField(
+                    label="Base URL",
+                    hint_text="https://api.anthropic.com/v1"
+                ),
+                
+                ft.Divider(),
+                
+                # Prompt templates
+                ft.Text("Prompt Templates:", size=16, weight=ft.FontWeight.BOLD),
+                ft.DataTable(
+                    columns=[
+                        ft.DataColumn(ft.Text("Name")),
+                        ft.DataColumn(ft.Text("Shortcut")),
+                        ft.DataColumn(ft.Text("Actions")),
+                    ],
+                    rows=[
+                        ft.DataRow(cells=[
+                            ft.DataCell(ft.Text("Code Generation")),
+                            ft.DataCell(ft.Text("/code")),
+                            ft.DataCell(ft.IconButton(ft.icons.PLAY_ARROW, icon_size=20)),
+                        ]),
+                        ft.DataRow(cells=[
+                            ft.DataCell(ft.Text("Debug Help")),
+                            ft.DataCell(ft.Text("/debug")),
+                            ft.DataCell(ft.IconButton(ft.icons.PLAY_ARROW, icon_size=20)),
+                        ]),
+                    ]
+                )
+            ], scroll=ft.ScrollMode.AUTO),
+            padding=20
+        )
+    
+    async def connect_to_server(self, server_name: str):
+        """Connect to an MCP server"""
+        if server_name in self.connected_servers:
+            await self.disconnect_server(server_name)
+            return
+        
+        config = self.predefined_servers[server_name]
+        
+        try:
+            # Update UI to show connecting
+            await self.update_status(f"Connecting to {server_name}...", ft.colors.ORANGE)
+            
+            # Connect based on server type
+            if config["type"] == "stdio":
+                session = await self.connect_stdio_server(config)
+            elif config["type"] == "sse":
+                session = await self.connect_sse_server(config)
+            else:
+                raise ValueError(f"Unsupported server type: {config['type']}")
+            
+            # Initialize the session
+            await session.initialize()
+            
+            # List available tools
+            response = await session.list_tools()
+            tools = response.tools
+            
+            # Store session and tools
+            self.active_sessions[server_name] = session
+            self.connected_servers[server_name] = {
+                "config": config,
+                "tools": tools,
+                "connected_at": datetime.now()
+            }
+            
+            # Update tools list
+            await self.update_tools_list()
+            
+            # Update UI
+            await self.add_server_to_list(server_name, config, tools)
+            await self.update_status(f"Connected to {server_name}", ft.colors.GREEN)
+            
+            # Show success message in chat
+            await self.add_chat_message(
+                "System",
+                f"✅ Connected to {server_name} server\n"
+                f"Available tools: {len(tools)}\n"
+                f"Type '/tools' to see all available tools",
+                ft.colors.BLUE
+            )
+            
+        except Exception as e:
+            error_msg = f"Failed to connect to {server_name}: {str(e)}"
+            await self.update_status(error_msg, ft.colors.RED)
+            await self.add_chat_message("System", f"❌ {error_msg}", ft.colors.RED)
+    
+    async def connect_stdio_server(self, config: Dict) -> ClientSession:
+        """Connect to a stdio-based MCP server"""
+        server_params = StdioServerParameters(
+            command=config["command"],
+            args=config.get("args", [])
+        )
+        
+        stdio_client = stdio.StdioClient(server_params)
+        await stdio_client.__aenter__()
+        
+        return ClientSession(stdio_client.read, stdio_client.write)
+    
+    async def connect_sse_server(self, config: Dict) -> ClientSession:
+        """Connect to an SSE-based MCP server"""
+        async with aiohttp.ClientSession() as http_session:
+            sse_client = sse.SSEClient(http_session, config["url"])
+            await sse_client.__aenter__()
+            
+            return ClientSession(sse_client.read, sse_client.write)
+    
+    async def disconnect_server(self, server_name: str):
+        """Disconnect from an MCP server"""
+        if server_name in self.active_sessions:
+            session = self.active_sessions[server_name]
+            await session.__aexit__(None, None, None)
+            del self.active_sessions[server_name]
+        
+        if server_name in self.connected_servers:
+            del self.connected_servers[server_name]
+        
+        # Update UI
+        await self.update_tools_list()
+        await self.refresh_servers_list()
+        await self.update_status("Disconnected", ft.colors.RED)
+        
+        await self.add_chat_message(
+            "System",
+            f"🔌 Disconnected from {server_name} server",
+            ft.colors.ORANGE
+        )
+    
+    async def toggle_server_connection(self, e):
+        """Toggle server connection on button click"""
+        server_name = e.control.data["name"]
+        await self.connect_to_server(server_name)
+    
+    async def execute_tool(self, server_name: str, tool_name: str, arguments: Dict):
+        """Execute an MCP tool"""
+        if server_name not in self.active_sessions:
+            return {"error": f"Server {server_name} not connected"}
+        
+        try:
+            session = self.active_sessions[server_name]
+            result = await session.call_tool(tool_name, arguments)
+            
+            # Display tool execution
+            await self.update_tool_output(
+                f"🛠️ Tool: {tool_name}\n"
+                f"Server: {server_name}\n"
+                f"Arguments: {json.dumps(arguments, indent=2)}\n"
+                f"Result: {json.dumps(result, indent=2)}"
+            )
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"Tool execution failed: {str(e)}"
+            await self.update_tool_output(f"❌ {error_msg}")
+            return {"error": error_msg}
+    
+    async def send_message_async(self, e):
+        """Handle sending messages with MCP tool integration"""
+        message = self.message_input.value.strip()
+        if not message:
+            return
+        
+        # Clear input
+        self.message_input.value = ""
+        await self.message_input.update_async()
+        
+        # Add user message to chat
+        await self.add_chat_message("You", message, ft.colors.BLUE)
+        
+        # Check for special commands
+        if message.lower() == "/tools" or "what available tools" in message.lower():
+            await self.list_available_tools()
+            return
+        
+        if message.lower().startswith("/tool "):
+            await self.handle_tool_command(message[6:])
+            return
+        
+        # Otherwise, simulate AI response (in real app, this would call AI API)
+        await asyncio.sleep(1)
+        
+        # Check if any tools should be used based on message
+        tool_result = await self.auto_detect_tools(message)
+        
+        if tool_result:
+            ai_response = f"I used tools to help with your request:\n\n{tool_result}\n\nIs there anything else I can help with?"
+        else:
+            ai_response = (
+                f"I'm ready to help! You can:\n"
+                f"1. Type '/tools' to see available MCP tools\n"
+                f"2. Ask me to use specific tools\n"
+                f"3. Just chat normally\n\n"
+                f"Connected servers: {', '.join(self.connected_servers.keys())}"
+            )
+        
+        await self.add_chat_message("AI", ai_response, ft.colors.GREEN)
+    
+    async def list_available_tools(self):
+        """List all available MCP tools"""
+        if not self.connected_servers:
+            await self.add_chat_message(
+                "System",
+                "No MCP servers connected. Please connect a server first.",
+                ft.colors.ORANGE
+            )
+            return
+        
+        tools_text = "🔧 **Available MCP Tools:**\n\n"
+        
+        for server_name, server_info in self.connected_servers.items():
+            tools = server_info["tools"]
+            tools_text += f"**{server_name}** ({len(tools)} tools):\n"
+            
+            for tool in tools:
+                tools_text += f"  • {tool.name}: {tool.description}\n"
+                if tool.inputSchema:
+                    params = tool.inputSchema.get("properties", {})
+                    if params:
+                        tools_text += f"    Parameters: {', '.join(params.keys())}\n"
+            tools_text += "\n"
+        
+        tools_text += "\nUse: `/tool [server].[tool_name] [args]` to execute a tool."
+        
+        await self.add_chat_message("System", tools_text, ft.colors.BLUE)
+    
+    async def handle_tool_command(self, command: str):
+        """Handle tool execution commands"""
+        try:
+            # Parse command format: server.tool_name {"arg": "value"}
+            parts = command.split(" ", 1)
+            tool_path = parts[0]
+            args_json = parts[1] if len(parts) > 1 else "{}"
+            
+            server_name, tool_name = tool_path.split(".")
+            arguments = json.loads(args_json)
+            
+            # Execute the tool
+            result = await self.execute_tool(server_name, tool_name, arguments)
+            
+            # Show result in chat
+            await self.add_chat_message(
+                "Tool Result",
+                json.dumps(result, indent=2),
+                ft.colors.PURPLE
+            )
+            
+        except Exception as e:
+            await self.add_chat_message(
+                "System",
+                f"Invalid tool command: {str(e)}\n\n"
+                f"Format: /tool server.tool_name {{\"arg\": \"value\"}}",
+                ft.colors.RED
+            )
+    
+    async def auto_detect_tools(self, message: str):
+        """Auto-detect and use relevant tools based on message content"""
+        if not self.connected_servers:
+            return None
+        
+        tool_results = []
+        
+        # Simple keyword-based tool detection
+        if "file" in message.lower() and "filesystem" in self.connected_servers:
+            # Example: list files
+            try:
+                result = await self.execute_tool(
+                    "filesystem",
+                    "read_file",
+                    {"path": ".", "directory": True}
+                )
+                tool_results.append(f"📁 Files in current directory: {result}")
+            except:
+                pass
+        
+        if "memory" in message.lower() and "memory" in self.connected_servers:
+            # Example: list memories
+            try:
+                result = await self.execute_tool(
+                    "memory",
+                    "list_memories",
+                    {}
+                )
+                tool_results.append(f"🧠 Memories: {result}")
+            except:
+                pass
+        
+        return "\n".join(tool_results) if tool_results else None
+    
+    async def update_tools_list(self):
+        """Update the tools list display"""
+        self.tools_list.controls.clear()
+        
+        for server_name, server_info in self.connected_servers.items():
+            self.tools_list.controls.append(
+                ft.ListTile(
+                    title=ft.Text(server_name, weight=ft.FontWeight.BOLD),
+                    leading=ft.Icon(ft.icons.STORAGE, color=ft.colors.GREEN)
+                )
+            )
+            
+            for tool in server_info["tools"]:
+                self.tools_list.controls.append(
+                    ft.ListTile(
+                        title=ft.Text(f"  {tool.name}"),
+                        subtitle=ft.Text(tool.description[:100] + "..." if len(tool.description) > 100 else tool.description),
+                        dense=True
+                    )
+                )
+        
+        await self.tools_list.update_async()
+    
+    async def add_server_to_list(self, server_name: str, config: Dict, tools: List):
+        """Add server to the connected servers list"""
+        self.servers_list.controls.append(
+            ft.ListTile(
+                title=ft.Text(server_name),
+                subtitle=ft.Text(f"{config['description']} - {len(tools)} tools"),
+                leading=ft.Icon(ft.icons.CHECK_CIRCLE, color=ft.colors.GREEN),
+                trailing=ft.IconButton(
+                    icon=ft.icons.DISCONNECT,
+                    on_click=lambda e, name=server_name: self.disconnect_server(name),
+                    tooltip="Disconnect"
+                )
+            )
+        )
+        await self.servers_list.update_async()
+    
+    async def refresh_servers_list(self):
+        """Refresh the servers list display"""
+        self.servers_list.controls.clear()
+        
+        for server_name, server_info in self.connected_servers.items():
+            self.servers_list.controls.append(
+                ft.ListTile(
+                    title=ft.Text(server_name),
+                    subtitle=ft.Text(f"{server_info['config']['description']} - {len(server_info['tools'])} tools"),
+                    leading=ft.Icon(ft.icons.CHECK_CIRCLE, color=ft.colors.GREEN),
+                    trailing=ft.IconButton(
+                        icon=ft.icons.DISCONNECT,
+                        on_click=lambda e, name=server_name: self.disconnect_server(name),
+                        tooltip="Disconnect"
+                    )
+                )
+            )
+        
+        await self.servers_list.update_async()
+    
+    async def add_chat_message(self, sender: str, message: str, color: ft.colors = None):
+        """Add a message to the chat display"""
+        message_card = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Text(sender, weight=ft.FontWeight.BOLD, color=color or ft.colors.BLACK),
+                    ft.Text(datetime.now().strftime("%H:%M"), size=10, color=ft.colors.GREY_600)
+                ]),
+                ft.Text(message, selectable=True),
+            ]),
+            padding=10,
+            border=ft.border.all(1, ft.colors.OUTLINE_VARIANT),
+            border_radius=8,
+            bgcolor=ft.colors.SURFACE_VARIANT if sender == "AI" else ft.colors.SURFACE,
+            margin=ft.margin.only(bottom=10)
+        )
+        
+        self.chat_display.controls.append(message_card)
+        await self.chat_display.update_async()
+    
+    async def update_tool_output(self, text: str):
+        """Update the tool output display"""
+        self.tool_output.controls.append(
+            ft.Container(
+                content=ft.Column([
+                    ft.Text(datetime.now().strftime("%H:%M:%S"), size=10, color=ft.colors.GREY),
+                    ft.Text(text, selectable=True, font_family="monospace")
+                ]),
+                padding=5,
+                border=ft.border.all(1, ft.colors.OUTLINE),
+                border_radius=5,
+                bgcolor=ft.colors.SURFACE_VARIANT
+            )
+        )
+        await self.tool_output.update_async()
+    
+    async def update_status(self, message: str, color: ft.colors):
+        """Update the connection status"""
+        self.status_indicator.controls[0].color = color
+        self.status_indicator.controls[1].value = message
+        await self.status_indicator.update_async()
+    
+    async def refresh_tools(self, e):
+        """Refresh the tools list"""
+        await self.update_tools_list()
+        await self.add_chat_message("System", "Tools list refreshed", ft.colors.BLUE)
+    
+    async def clear_chat(self, e):
+        """Clear the chat history"""
+        self.chat_display.controls.clear()
+        await self.chat_display.update_async()
+    
+    async def model_changed(self, e):
+        """Handle model selection change"""
+        self.current_model = e.control.value
+        await self.add_chat_message(
+            "System",
+            f"AI model changed to: {self.current_model}",
+            ft.colors.BLUE
+        )
+
+# Install required packages:
+# pip install flet mcp aiohttp
+
+# Note: For stdio servers, you need Node.js and the MCP servers installed:
+# npm install -g @modelcontextprotocol/server-filesystem
+# npm install -g @modelcontextprotocol/server-memory
+
+if __name__ == "__main__":
+    app = MCPStudioFlet()
+    ft.app(target=app.main)
